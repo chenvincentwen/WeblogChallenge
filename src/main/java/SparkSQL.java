@@ -63,7 +63,6 @@ public class SparkSQL {
         new StructField("user_agent", StringType, false, Metadata.empty()),
         new StructField("ssl_cipher", StringType, false, Metadata.empty()),
         new StructField("ssl_protocol", StringType, false, Metadata.empty()),
-        new StructField("quarter", StringType, true, Metadata.empty())
     });
 
     JavaRDD<String> textFile = sc.textFile(ClassLoader.getSystemClassLoader()
@@ -78,26 +77,6 @@ public class SparkSQL {
           if (i == 1) {
             String ts = matcher.group(i);
             parsedArray[0] = LocalDateTime.from(formatter.parse(ts)).toEpochSecond(ZoneOffset.UTC);
-            int min = Integer.valueOf(ts.substring(14, 16));
-            String quarter = null;
-
-            // I tried a few times and 15 min seems legit, from bare eye-spotting.
-            // Most clients are pretty much just did one time visit.
-            // However this is an open implementation. Other factors could be user agent and request url relations
-            // I would recommend to use a graph database like new4j to get the best session definition
-            if (0 <= min && min < 15) {
-              quarter = "1";
-            } else if (15 <= min && min < 30) {
-              quarter = "2";
-            } else if (30 <= min && min < 45) {
-              quarter = "3";
-            } else if (45 <= min && min < 60) {
-              quarter = "4";
-            } else {
-              System.out.println(" invalid min: " + min);
-              System.exit(2);
-            }
-            parsedArray[matcher.groupCount()] = ts.substring(0, 13) + "Q" + quarter;
           } else {
             parsedArray[i - 1] = matcher.group(i);
           }
@@ -108,24 +87,47 @@ public class SparkSQL {
 
     Dataset<Row> dataset = sparkSession.createDataFrame(rowRDD, schema);
 
-//    // enable this if you want to writes session files into a specific path
-//    dataset.write().partitionBy("client_ip", "quarter")
+    // this create a local spark-warehouse with the session data partitioned
+    dataset.write().saveAsTable("raw_data");
+    hiveContext.sql(
+        "SELECT " +
+            "ts, elb, client_ip, client_port, backend_ip_and_port, request_processing_time, " +
+            "backend_processing_time, response_processing_time, elb_status_code, backend_status_code, " +
+            "received_bytes, sent_bytes, request, user_agent, ssl_cipher, ssl_protocol, " +
+            "SUM(time_group_flag) OVER (ORDER BY client_ip, ts) AS session_id " +
+          "FROM(" +
+            "SELECT " +
+              "*, IF(((client_ip == prev_client_ip) AND ((ts - prev_ts) < 900)), 0, 1) as time_group_flag " +
+            "FROM(" +
+              "SELECT " +
+                "*, LAG(ts) OVER (ORDER BY client_ip, ts) as prev_ts, " +
+                "LAG(client_ip) OVER (ORDER BY client_ip, ts) as prev_client_ip " +
+              "FROM " +
+                "raw_data " +
+              "GROUP BY " +
+                "ts, elb, client_ip, client_port, backend_ip_and_port, request_processing_time, " +
+                "backend_processing_time, response_processing_time, elb_status_code, backend_status_code, " +
+                "received_bytes, sent_bytes, request, user_agent, ssl_cipher, ssl_protocol " +
+              "ORDER BY " +
+                "client_ip, ts)" +
+          ")").write().partitionBy("client_ip", "session_id").saveAsTable("parsed_data");
+
+        // enable this if you want to writes session files into a specific path
+//    dataset.write().partitionBy("client_ip", "session_id")
 //        .csv(ClassLoader.getSystemClassLoader().getResource(".").getPath() + "output");
 
-    // this create a local spark-warehouse with the session data partitioned
-    dataset.write().partitionBy("client_ip", "quarter").saveAsTable("parsed_data");
 
     //average session_time
     System.out.println("average session_time");
     hiveContext.sql(
         "SELECT avg(session_time) as average_session_time from (" +
-              "SELECT (MAX(ts) - MIN(ts)) as session_time, client_ip, quarter " +
-              "FROM parsed_data GROUP BY client_ip, quarter)").show();
+              "SELECT (MAX(ts) - MIN(ts)) as session_time, client_ip, session_id " +
+              "FROM parsed_data GROUP BY client_ip, session_id)").show();
 
     //unique URL visits per session
     System.out.println("unique URL visits per session");
-    hiveContext.sql("SELECT DISTINCT request as dr, client_ip, quarter " +
-        "FROM parsed_data GROUP BY client_ip, quarter, dr").show();
+    hiveContext.sql("SELECT DISTINCT request as dr, session_id " +
+        "FROM parsed_data GROUP BY session_id, dr ORDER BY session_id").show();
 
     //most engaged users
     hiveContext.sql(
